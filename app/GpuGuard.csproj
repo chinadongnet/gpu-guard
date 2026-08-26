@@ -10,6 +10,9 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
-    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Invariant mode makes any non-invariant culture throw CultureNotFoundException;
+         the zh-CN UI needs real culture data, so keep ICU and allow custom OS locales. -->
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <PredefinedCulturesOnly>false</PredefinedCulturesOnly>
   </PropertyGroup>
 </Project>
