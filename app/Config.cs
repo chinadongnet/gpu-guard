@@ -2,21 +2,43 @@ using System.Text.Json;
 
 namespace GpuGuard;
 
+/// <summary>How the guard lowers heat output.</summary>
+public enum ControlMode
+{
+    /// <summary>Try clock locking; if the GPU/driver refuses (typical for GeForce on Windows), fall back to the power limit.</summary>
+    Auto = 0,
+    /// <summary>nvidia-smi --lock-gpu-clocks only.</summary>
+    Clock = 1,
+    /// <summary>nvidia-smi --power-limit only.</summary>
+    Power = 2,
+}
+
 /// <summary>User-adjustable cooling rules + app state. Persisted to %APPDATA%\GpuGuard\config.json.</summary>
 public sealed class Config
 {
     public int GpuIndex { get; set; } = 0;
     public bool AutoCoolEnabled { get; set; } = true;
+    public ControlMode ControlMode { get; set; } = ControlMode.Auto;
     public int TargetTempC { get; set; } = 70;      // drop clocks above this
     public int CoolTempC { get; set; } = 65;        // raise clocks again at/below this
     public int CriticalTempC { get; set; } = 76;    // 3x step drop above this
     public int CheckIntervalSec { get; set; } = 5;
+
+    // Clock-lock mode. Ceiling is additionally clamped to the GPU's clocks.max.sm and
+    // ClockLockMinMHz to the lowest supported graphics clock (210 MHz on Ampere/RTX 30).
     public int ClockCeilingMHz { get; set; } = 2100;
     public int ClockFloorMHz { get; set; } = 900;
     public int ClockLockMinMHz { get; set; } = 180;
     public int StepDownMHz { get; set; } = 75;
     public int StepUpMHz { get; set; } = 45;
-    public int PowerLimitW { get; set; } = 0;       // 0 = untouched
+
+    // Power-limit mode (also the optional one-time safety cap in clock mode).
+    // PowerLimitW: 0 = GPU default limit; PowerFloorW: 0 = GPU minimum limit.
+    public int PowerLimitW { get; set; } = 0;
+    public int PowerFloorW { get; set; } = 0;
+    public int PowerStepDownW { get; set; } = 15;
+    public int PowerStepUpW { get; set; } = 10;
+
     public string Profile { get; set; } = "normal"; // "cool" | "normal" | "custom"
 
     /// <summary>Built-in strategies: name -> (target, cool, critical). Clock/step settings are kept.</summary>
@@ -24,6 +46,13 @@ public sealed class Config
     {
         ("cool",   "低温策略（≤60 °C，优先控温）", 60, 55, 66),
         ("normal", "常规策略（≤70 °C，平衡性能）", 70, 65, 76),
+    };
+
+    public static readonly (ControlMode Mode, string Label)[] ControlModes =
+    {
+        (ControlMode.Auto,  "自动（优先锁频，不支持则限功耗）"),
+        (ControlMode.Clock, "锁频（--lock-gpu-clocks）"),
+        (ControlMode.Power, "限功耗（--power-limit）"),
     };
 
     public void ApplyPreset(string key)
@@ -66,7 +95,9 @@ public sealed class Config
         if (ClockFloorMHz > ClockCeilingMHz) return "频率下限不能高于频率上限。";
         if (ClockLockMinMHz > ClockFloorMHz) return "锁频最低值不能高于频率下限。";
         if (CheckIntervalSec < 1) return "检测间隔至少 1 秒。";
-        if (StepDownMHz < 1 || StepUpMHz < 1) return "步进必须大于 0。";
+        if (StepDownMHz < 1 || StepUpMHz < 1) return "频率步进必须大于 0。";
+        if (PowerStepDownW < 1 || PowerStepUpW < 1) return "功耗步进必须大于 0。";
+        if (PowerLimitW > 0 && PowerFloorW > PowerLimitW) return "功耗下限不能高于功耗上限。";
         return null;
     }
 

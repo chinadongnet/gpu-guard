@@ -15,8 +15,10 @@ public sealed class MainForm : Form
     private readonly Label _lblFan = new();
     private readonly Label _lblUtil = new();
     private readonly Label _lblMem = new();
+    private readonly Label _lblMode = new();
     private readonly Label _lblCap = new();
     private readonly Label _lblAction = new();
+    private readonly Label _lblNotice = new();
     private readonly Label _lblError = new();
 
     private readonly CheckBox _chkAuto = new() { Text = "启用自动 GPU 降温（锁频）", AutoSize = true, Font = new Font("Microsoft YaHei UI", 10, FontStyle.Bold) };
@@ -24,6 +26,7 @@ public sealed class MainForm : Form
     private readonly ToolStripMenuItem _menuAuto = new("自动降温");
     private readonly ToolStripMenuItem _menuProfile = new("降温策略");
     private readonly ComboBox _cmbProfile = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 300 };
+    private readonly ComboBox _cmbMode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 300 };
 
     // Rule settings
     private readonly NumericUpDown _numGpu = Num(0, 15);
@@ -37,6 +40,9 @@ public sealed class MainForm : Form
     private readonly NumericUpDown _numStepDown = Num(1, 1000);
     private readonly NumericUpDown _numStepUp = Num(1, 1000);
     private readonly NumericUpDown _numPower = Num(0, 1000);
+    private readonly NumericUpDown _numPowerFloor = Num(0, 1000);
+    private readonly NumericUpDown _numPowerStepDown = Num(1, 200);
+    private readonly NumericUpDown _numPowerStepUp = Num(1, 200);
 
     private bool _loadingUi;
 
@@ -51,7 +57,7 @@ public sealed class MainForm : Form
         MaximizeBox = false;
         Font = new Font("Microsoft YaHei UI", 9.5f);
         AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(480, 800);
+        ClientSize = new Size(480, 900);
         ShowInTaskbar = false;
 
         BuildLayout();
@@ -102,8 +108,11 @@ public sealed class MainForm : Form
         AddRow(lt, "风扇", _lblFan);
         AddRow(lt, "占用率", _lblUtil);
         AddRow(lt, "显存", _lblMem);
-        AddRow(lt, "当前锁频上限", _lblCap);
+        AddRow(lt, "控制方式", _lblMode);
+        AddRow(lt, "当前限制", _lblCap);
         AddRow(lt, "当前动作", _lblAction);
+        _lblNotice.ForeColor = Color.DarkOrange; _lblNotice.AutoSize = true; _lblNotice.MaximumSize = new Size(400, 0);
+        lt.Controls.Add(_lblNotice); lt.SetColumnSpan(_lblNotice, 2);
         _lblError.ForeColor = Color.Firebrick; _lblError.AutoSize = true; _lblError.MaximumSize = new Size(400, 0);
         lt.Controls.Add(_lblError); lt.SetColumnSpan(_lblError, 2);
         _lblTemp.Font = new Font("Microsoft YaHei UI", 14, FontStyle.Bold);
@@ -130,19 +139,26 @@ public sealed class MainForm : Form
         _cmbProfile.Items.Add("自定义（手动设置温度）");
         _cmbProfile.SelectedIndexChanged += (_, _) => { if (!_loadingUi) OnProfileChanged(); };
         rt.Controls.Add(_cmbProfile); rt.SetColumnSpan(_cmbProfile, 3);
+        rt.Controls.Add(new Label { Text = "控制方式", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 0, 0) });
+        foreach (var m in Config.ControlModes) _cmbMode.Items.Add(m.Label);
+        rt.Controls.Add(_cmbMode); rt.SetColumnSpan(_cmbMode, 3);
         AddPair(rt, "GPU 序号", _numGpu, "检测间隔 (秒)", _numInterval);
         AddPair(rt, "降温温度 (°C) >", _numTarget, "恢复温度 (°C) ≤", _numCool);
-        AddPair(rt, "紧急温度 (°C) ≥", _numCritical, "功耗上限 (W)", _numPower);
+        AddPair(rt, "紧急温度 (°C) ≥", _numCritical, "", null);
         AddPair(rt, "频率上限 (MHz)", _numCeiling, "频率下限 (MHz)", _numFloor);
         AddPair(rt, "降频步进 (MHz)", _numStepDown, "升频步进 (MHz)", _numStepUp);
         AddPair(rt, "锁频最低 (MHz)", _numLockMin, "", null);
+        AddPair(rt, "功耗上限 (W)", _numPower, "功耗下限 (W)", _numPowerFloor);
+        AddPair(rt, "降功耗步进 (W)", _numPowerStepDown, "升功耗步进 (W)", _numPowerStepUp);
         foreach (var n in new[] { _numTarget, _numCool, _numCritical })
             n.ValueChanged += (_, _) => { if (!_loadingUi) SetProfileUi(ReadUiConfig().DetectProfile()); };
         var help = new Label
         {
             AutoSize = true, MaximumSize = new Size(410, 0), ForeColor = Color.DimGray,
-            Text = "逻辑：功耗上限 0 = 不限制。温度 > 降温温度 → 每次检测把频率上限下调一个步进；≥ 紧急温度 → 下调 3 倍步进；" +
-                   "≤ 恢复温度 → 上调一个步进，直至频率上限。频率永远不低于频率下限。",
+            Text = "逻辑：温度 > 降温温度 → 每次检测把限制下调一个步进；≥ 紧急温度 → 下调 3 倍步进；≤ 恢复温度 → 上调一个步进，直至上限；永远不低于下限。" +
+                   "锁频模式用频率参数（上限自动钳到显卡最高频率，锁频最低自动钳到显卡支持的最低频率）；" +
+                   "限功耗模式用功耗参数（0 = 使用显卡默认/最低功耗限制）。GeForce 卡（如 RTX 3090）在 Windows 下通常不支持锁频，「自动」会改用限功耗。" +
+                   "锁频模式下功耗上限 > 0 时作为一次性安全上限。",
             Padding = new Padding(0, 6, 0, 6),
         };
         rt.Controls.Add(help); rt.SetColumnSpan(help, 4);
@@ -185,6 +201,9 @@ public sealed class MainForm : Form
         _numCritical.Value = c.CriticalTempC; _numInterval.Value = c.CheckIntervalSec;
         _numCeiling.Value = c.ClockCeilingMHz; _numFloor.Value = c.ClockFloorMHz; _numLockMin.Value = c.ClockLockMinMHz;
         _numStepDown.Value = c.StepDownMHz; _numStepUp.Value = c.StepUpMHz; _numPower.Value = c.PowerLimitW;
+        _numPowerFloor.Value = c.PowerFloorW; _numPowerStepDown.Value = Math.Max(1, c.PowerStepDownW); _numPowerStepUp.Value = Math.Max(1, c.PowerStepUpW);
+        var mi = Array.FindIndex(Config.ControlModes, m => m.Mode == c.ControlMode);
+        _cmbMode.SelectedIndex = mi >= 0 ? mi : 0;
         _chkAuto.Checked = c.AutoCoolEnabled; _menuAuto.Checked = c.AutoCoolEnabled;
         SetProfileUi(c.DetectProfile());
         try { _chkAutostart.Checked = Autostart.IsEnabled(); } catch { }
@@ -197,6 +216,8 @@ public sealed class MainForm : Form
         CriticalTempC = (int)_numCritical.Value, CheckIntervalSec = (int)_numInterval.Value,
         ClockCeilingMHz = (int)_numCeiling.Value, ClockFloorMHz = (int)_numFloor.Value, ClockLockMinMHz = (int)_numLockMin.Value,
         StepDownMHz = (int)_numStepDown.Value, StepUpMHz = (int)_numStepUp.Value, PowerLimitW = (int)_numPower.Value,
+        PowerFloorW = (int)_numPowerFloor.Value, PowerStepDownW = (int)_numPowerStepDown.Value, PowerStepUpW = (int)_numPowerStepUp.Value,
+        ControlMode = _cmbMode.SelectedIndex >= 0 ? Config.ControlModes[_cmbMode.SelectedIndex].Mode : ControlMode.Auto,
         AutoCoolEnabled = _chkAuto.Checked,
         Profile = _cmbProfile.SelectedIndex >= 0 && _cmbProfile.SelectedIndex < Config.Presets.Length ? Config.Presets[_cmbProfile.SelectedIndex].Key : "custom",
     };
@@ -272,11 +293,17 @@ public sealed class MainForm : Form
             _lblUtil.Text = $"{s.UtilPct} %";
             _lblMem.Text = $"{s.MemUsedMiB} / {s.MemTotalMiB} MiB";
         }
-        _lblCap.Text = _engine.CurrentCapMHz > 0 ? $"{_engine.CurrentCapMHz} MHz  (上限 {cfg.ClockCeilingMHz})" : "未锁频";
+        _lblMode.Text = _engine.ModeText;
+        _lblCap.Text = _engine.CapText;
+        var power = _engine.Active == ActiveMode.Power;
         _lblAction.Text = _engine.LastAction switch
         {
-            "drop" => "降频中", "critical-drop" => "紧急降频中", "raise" => "升频中", "hold" => "保持", "off" => "自动降温已关闭", _ => _engine.LastAction,
+            "drop" => power ? "降功耗中" : "降频中",
+            "critical-drop" => power ? "紧急降功耗中" : "紧急降频中",
+            "raise" => power ? "升功耗中" : "升频中",
+            "hold" => "保持", "clamp" => "钳位到范围内", "off" => "自动降温已关闭", _ => _engine.LastAction,
         };
+        _lblNotice.Text = _engine.Notice ?? "";
         _lblError.Text = _engine.LastError ?? "";
         if (_menuAuto.Checked != cfg.AutoCoolEnabled) _menuAuto.Checked = cfg.AutoCoolEnabled;
         RefreshTray();
@@ -292,7 +319,11 @@ public sealed class MainForm : Form
         old?.Dispose();
         var tip = s == null ? "GPU Guard" :
             $"GPU {s.TempC}°C  {s.ClockSmMHz}MHz  {s.PowerDrawW:N0}W\n" +
-            (cfg.AutoCoolEnabled ? (_engine.IsThrottling ? $"降温中 上限{_engine.CurrentCapMHz}MHz" : "自动降温：开") : "自动降温：关") +
+            (cfg.AutoCoolEnabled
+                ? (_engine.IsThrottling
+                    ? (_engine.Active == ActiveMode.Power ? $"降温中 限{_engine.CurrentPowerCapW}W" : $"降温中 上限{_engine.CurrentCapMHz}MHz")
+                    : "自动降温：开")
+                : "自动降温：关") +
             $" ≤{cfg.TargetTempC}°C";
         _tray.Text = tip.Length > 63 ? tip[..63] : tip;
     }
