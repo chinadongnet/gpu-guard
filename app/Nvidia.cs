@@ -79,7 +79,8 @@ public static class Nvidia
     {
         const string q = "index,name,temperature.gpu,clocks.sm,power.draw,fan.speed,utilization.gpu,memory.used,memory.total," +
                          "power.min_limit,power.max_limit,power.default_limit,power.limit,clocks.max.sm,driver_model.current";
-        var line = Run("--id", gpuIndex.ToString(), $"--query-gpu={q}", "--format=csv,noheader,nounits").Trim();
+        // Use -i and --flag=value: nvidia-smi 512.x rejects "--id 0" and space-separated long options.
+        var line = Run("-i", gpuIndex.ToString(), $"--query-gpu={q}", "--format=csv,noheader,nounits").Trim();
         var f = line.Split(',').Select(s => s.Trim()).ToArray();
         if (f.Length < 15) throw new InvalidOperationException("nvidia-smi 输出异常: " + line);
         var ci = CultureInfo.InvariantCulture;
@@ -99,7 +100,7 @@ public static class Nvidia
     {
         try
         {
-            var text = Run("--id", gpuIndex.ToString(), "-q", "-d", "SUPPORTED_CLOCKS");
+            var text = Run("-i", gpuIndex.ToString(), "-q", "-d", "SUPPORTED_CLOCKS");
             int? min = null;
             foreach (Match m in Regex.Matches(text, @"Graphics\s*:\s*(\d+)\s*MHz"))
             {
@@ -112,11 +113,11 @@ public static class Nvidia
     }
 
     public static void LockClocks(int gpuIndex, int minMHz, int maxMHz) =>
-        RunSet("--id", gpuIndex.ToString(), "--lock-gpu-clocks", $"{minMHz},{maxMHz}");
+        RunSet("-i", gpuIndex.ToString(), $"--lock-gpu-clocks={minMHz},{maxMHz}");
 
     public static void ResetClocks(int gpuIndex) =>
-        RunSet("--id", gpuIndex.ToString(), "--reset-gpu-clocks");
+        RunSet("-i", gpuIndex.ToString(), "--reset-gpu-clocks");
 
     public static void SetPowerLimit(int gpuIndex, int watts) =>
-        RunSet("--id", gpuIndex.ToString(), "--power-limit", watts.ToString());
+        RunSet("-i", gpuIndex.ToString(), $"--power-limit={watts}");
 }
