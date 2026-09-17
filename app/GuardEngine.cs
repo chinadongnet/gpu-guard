@@ -110,11 +110,13 @@ public sealed class GuardEngine : IDisposable
                     _clockUnsupported = false; _minSupportedMHz = null; _probedGpu = -1; Notice = null;
                 }
                 else if (!cfg.AutoCoolEnabled && old.AutoCoolEnabled) ReleaseClocks();
-                else if (cfg.ControlMode != old.ControlMode && _active != ActiveMode.None)
+                else if (cfg.ControlMode != old.ControlMode)
                 {
-                    // Mode switched while running: release now, the next tick re-engages with the new mode.
-                    ReleaseClocks();
+                    // Mode switched: drop the old lever (if any) so the next tick re-engages.
+                    // Always clear Notice so a stale Auto-fallback message cannot outlive the mode.
+                    if (_active != ActiveMode.None) ReleaseClocks();
                     if (cfg.ControlMode != ControlMode.Auto) _clockUnsupported = false;
+                    Notice = null;
                 }
                 else if (cfg.AutoCoolEnabled && LastState is GpuState s)
                 {
@@ -144,9 +146,21 @@ public sealed class GuardEngine : IDisposable
             {
                 var s = Nvidia.Query(cfg.GpuIndex);
                 LastState = s;
-                LastError = null;
-                if (cfg.AutoCoolEnabled) Step(cfg, s);
-                else LastAction = "off";
+                if (cfg.AutoCoolEnabled)
+                {
+                    LastError = null;
+                    Step(cfg, s);
+                }
+                else
+                {
+                    // Keep retrying restore while a lever is still held; do not claim "off"
+                    // (or clear LastError) until ReleaseWith actually succeeds.
+                    lock (_lock)
+                    {
+                        if (_active != ActiveMode.None) ReleaseClocks();
+                        else { LastError = null; LastAction = "off"; }
+                    }
+                }
             }
             catch (Exception ex) { LastError = ex.Message; }
             Updated?.Invoke();
@@ -161,7 +175,12 @@ public sealed class GuardEngine : IDisposable
     private int ClockCeiling(Config cfg, GpuState s) =>
         s.MaxClockMHz > 0 ? Math.Min(cfg.ClockCeilingMHz, s.MaxClockMHz) : cfg.ClockCeilingMHz;
 
-    private int ClockFloor(Config cfg, GpuState s) => Math.Min(cfg.ClockFloorMHz, ClockCeiling(cfg, s));
+    private int ClockFloor(Config cfg, GpuState s)
+    {
+        var floor = cfg.ClockFloorMHz;
+        if (_minSupportedMHz is int sup && sup > floor) floor = sup;
+        return Math.Min(floor, ClockCeiling(cfg, s));
+    }
 
     private int ClockLockMin(Config cfg, GpuState s)
     {
@@ -235,9 +254,10 @@ public sealed class GuardEngine : IDisposable
         if (mode == ControlMode.Clock)
         {
             try { EngageClock(cfg, s); return; }
-            catch (Exception ex) when (cfg.ControlMode == ControlMode.Auto)
+            catch (NvidiaUnsupportedException ex) when (cfg.ControlMode == ControlMode.Auto)
             {
                 // Auto: the card refused clock locking -> remember and try the power limit instead.
+                // Other failures (bad range, transient driver error) must not be sticky-fallback.
                 _clockUnsupported = true;
                 try { Nvidia.ResetClocks(cfg.GpuIndex); } catch { }
                 _currentCap = 0;
@@ -298,16 +318,32 @@ public sealed class GuardEngine : IDisposable
 
     private void ReleaseWith(Config cfg)
     {
-        try
+        var failed = false;
+        if (_currentCap != 0)
         {
-            if (_currentCap != 0) Nvidia.ResetClocks(cfg.GpuIndex);
-            if (_restorePowerW is int w) { Nvidia.SetPowerLimit(cfg.GpuIndex, w); _restorePowerW = null; }
+            try { Nvidia.ResetClocks(cfg.GpuIndex); _currentCap = 0; }
+            catch (Exception ex)
+            {
+                failed = true;
+                LastError = ex.Message;
+                Log("reset clocks failed: " + ex.Message);
+            }
         }
-        catch (Exception ex) { LastError = ex.Message; Log("release failed: " + ex.Message); }
-        _currentCap = 0;
-        _currentPowerCap = 0;
-        _active = ActiveMode.None;
-        LastAction = "off";
+        if (_restorePowerW is int w)
+        {
+            try { Nvidia.SetPowerLimit(cfg.GpuIndex, w); _restorePowerW = null; _currentPowerCap = 0; }
+            catch (Exception ex)
+            {
+                failed = true;
+                LastError = ex.Message;
+                Log("restore power failed: " + ex.Message);
+            }
+        }
+        if (!failed)
+        {
+            _active = ActiveMode.None;
+            LastAction = "off";
+        }
     }
 
     private static string Shorten(string msg)
