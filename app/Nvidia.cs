@@ -75,12 +75,41 @@ public static class Nvidia
         throw new InvalidOperationException(msg);
     }
 
+    private const string QueryFields =
+        "index,name,temperature.gpu,clocks.sm,power.draw,fan.speed,utilization.gpu,memory.used,memory.total," +
+        "power.min_limit,power.max_limit,power.default_limit,power.limit,clocks.max.sm,driver_model.current";
+
+    public static int[] ListIndices() => ParseIndexList(Run("--query-gpu=index", "--format=csv,noheader,nounits"));
+
+    /// <summary>One nvidia-smi call, one row per installed GPU.</summary>
+    public static GpuState[] QueryAll()
+    {
+        var text = Run($"--query-gpu={QueryFields}", "--format=csv,noheader,nounits");
+        return text.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            .Select(l => l.Trim())
+            .Where(l => l.Length > 0)
+            .Select(ParseState)
+            .ToArray();
+    }
+
     public static GpuState Query(int gpuIndex)
     {
-        const string q = "index,name,temperature.gpu,clocks.sm,power.draw,fan.speed,utilization.gpu,memory.used,memory.total," +
-                         "power.min_limit,power.max_limit,power.default_limit,power.limit,clocks.max.sm,driver_model.current";
         // Use -i and --flag=value: nvidia-smi 512.x rejects "--id 0" and space-separated long options.
-        var line = Run("-i", gpuIndex.ToString(), $"--query-gpu={q}", "--format=csv,noheader,nounits").Trim();
+        var line = Run("-i", gpuIndex.ToString(), $"--query-gpu={QueryFields}", "--format=csv,noheader,nounits").Trim();
+        return ParseState(line);
+    }
+
+    public static int[] ParseIndexList(string text) =>
+        text.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            .Select(l => l.Trim())
+            .Where(l => int.TryParse(l, NumberStyles.Integer, CultureInfo.InvariantCulture, out _))
+            .Select(l => int.Parse(l, CultureInfo.InvariantCulture))
+            .Distinct()
+            .OrderBy(i => i)
+            .ToArray();
+
+    private static GpuState ParseState(string line)
+    {
         var f = line.Split(',').Select(s => s.Trim()).ToArray();
         if (f.Length < 15) throw new InvalidOperationException("nvidia-smi 输出异常: " + line);
         var ci = CultureInfo.InvariantCulture;

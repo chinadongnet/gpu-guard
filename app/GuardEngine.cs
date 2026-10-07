@@ -1,92 +1,48 @@
 namespace GpuGuard;
 
-/// <summary>Which lever the engine is currently holding.</summary>
+/// <summary>Which lever the engine is currently holding on one GPU.</summary>
 public enum ActiveMode { None, Clock, Power }
 
+/// <summary>One GPU's latest sample and the lever applied to it.</summary>
+public sealed record GpuReport(
+    int Index,
+    GpuState? State,
+    ActiveMode Active,
+    int CurrentCapMHz,
+    int CurrentPowerCapW,
+    string LastAction,
+    string? LastError,
+    string? Notice,
+    bool IsThrottling,
+    string CapText,
+    string ModeText);
+
 /// <summary>
-/// Background loop: samples the GPU every CheckIntervalSec and, when auto-cooling is on,
-/// modulates either the GPU clock ceiling (--lock-gpu-clocks) or the power limit
-/// (--power-limit) to keep temperature under TargetTempC.
+/// Background loop: samples every installed GPU (or one selected GPU) every CheckIntervalSec
+/// and, when auto-cooling is on, modulates either the clock ceiling (--lock-gpu-clocks) or
+/// the power limit (--power-limit) to keep that card under TargetTempC.
+/// Each card has its own lever and cap. The temperature rules are shared.
 ///
 /// Clock locking is the better lever on workstation cards (RTX PRO 4500: 150–200 W power
 /// range but 180–3090 MHz clock range) but is refused by many GeForce cards under the
 /// Windows WDDM driver (RTX 3090 etc.). Those cards have a wide power range (≈100–350 W+),
-/// so ControlMode.Auto probes clock locking once and falls back to the power limit.
+/// so ControlMode.Auto probes clock locking once per card and falls back to the power limit.
 /// </summary>
 public sealed class GuardEngine : IDisposable
 {
     private readonly object _lock = new();
+    private readonly Dictionary<int, Lane> _lanes = new();
     private Config _cfg;
     private CancellationTokenSource? _cts;
     private Task? _loop;
+    private string _loggedSet = "";
 
-    private ActiveMode _active = ActiveMode.None;
-    private int _currentCap;          // MHz, clock mode; 0 = clocks not locked
-    private int _currentPowerCap;     // W, power mode; 0 = not set
-    private int? _restorePowerW;      // power limit to put back on release
-    private bool _clockUnsupported;   // learned for the current GPU index this session
-    private int _probedGpu = -1;
-    private int? _minSupportedMHz;
-
-    public GpuState? LastState { get; private set; }
-    public string LastAction { get; private set; } = "idle";
     public string? LastError { get; private set; }
-    /// <summary>Non-fatal information for the UI, e.g. "clock locking unsupported, using power limit".</summary>
-    public string? Notice { get; private set; }
 
-    public ActiveMode Active { get { lock (_lock) return _active; } }
-    public int CurrentCapMHz => _currentCap;
-    public int CurrentPowerCapW => _currentPowerCap;
-
-    /// <summary>True when auto-cool is on and the active lever is below its ceiling (actively throttling).</summary>
+    /// <summary>True when auto-cool is on and any card's lever is below its ceiling.</summary>
     public bool IsThrottling
     {
-        get
-        {
-            lock (_lock)
-            {
-                if (!_cfg.AutoCoolEnabled || LastState is not GpuState s) return false;
-                return _active switch
-                {
-                    ActiveMode.Clock => _currentCap > 0 && _currentCap < ClockCeiling(_cfg, s),
-                    ActiveMode.Power => _currentPowerCap > 0 && _currentPowerCap < PowerCeiling(_cfg, s),
-                    _ => false,
-                };
-            }
-        }
-    }
-
-    /// <summary>Human-readable "current cap" line for the panel.</summary>
-    public string CapText
-    {
-        get
-        {
-            lock (_lock)
-            {
-                var s = LastState;
-                return _active switch
-                {
-                    ActiveMode.Clock => $"{_currentCap} MHz  (上限 {(s != null ? ClockCeiling(_cfg, s) : _cfg.ClockCeilingMHz)} MHz, 下限 {(s != null ? ClockFloor(_cfg, s) : _cfg.ClockFloorMHz)} MHz)",
-                    ActiveMode.Power => $"{_currentPowerCap} W  (上限 {(s != null ? PowerCeiling(_cfg, s) : _cfg.PowerLimitW)} W, 下限 {(s != null ? PowerFloor(_cfg, s) : _cfg.PowerFloorW)} W)",
-                    _ => "未干预",
-                };
-            }
-        }
-    }
-
-    /// <summary>Human-readable control-mode line for the panel.</summary>
-    public string ModeText
-    {
-        get
-        {
-            lock (_lock)
-            {
-                var cfgMode = _cfg.ControlMode switch { ControlMode.Clock => "锁频", ControlMode.Power => "限功耗", _ => "自动" };
-                var act = _active switch { ActiveMode.Clock => "锁频", ActiveMode.Power => "限功耗", _ => _cfg.AutoCoolEnabled ? "待探测" : "—" };
-                var hint = _clockUnsupported ? "，本卡不支持锁频" : "";
-                return $"{cfgMode} → 实际: {act}{hint}";
-            }
-        }
+        get { lock (_lock) return _lanes.Values.Any(lane => LaneThrottling(lane)); }
     }
 
     public event Action? Updated;
@@ -94,6 +50,11 @@ public sealed class GuardEngine : IDisposable
     public GuardEngine(Config cfg) { _cfg = cfg; }
 
     public Config Config { get { lock (_lock) return _cfg; } }
+
+    public IReadOnlyList<GpuReport> Reports
+    {
+        get { lock (_lock) return _lanes.Values.OrderBy(l => l.Index).Select(ToReport).ToList(); }
+    }
 
     public void ApplyConfig(Config cfg)
     {
@@ -103,24 +64,34 @@ public sealed class GuardEngine : IDisposable
             _cfg = cfg;
             try
             {
-                if (cfg.GpuIndex != old.GpuIndex)
+                var indices = IndicesFor(cfg);
+                if (indices.Length > 0) RetainOnly(indices);
+
+                if (!cfg.AutoCoolEnabled && old.AutoCoolEnabled)
                 {
-                    // Different card: drop everything we learned and release the old one.
-                    if (_active != ActiveMode.None) ReleaseWith(old);
-                    _clockUnsupported = false; _minSupportedMHz = null; _probedGpu = -1; Notice = null;
+                    foreach (var lane in _lanes.Values) ReleaseLane(lane);
                 }
-                else if (!cfg.AutoCoolEnabled && old.AutoCoolEnabled) ReleaseClocks();
-                else if (cfg.ControlMode != old.ControlMode && _active != ActiveMode.None)
+                else if (cfg.ControlMode != old.ControlMode)
                 {
-                    // Mode switched while running: release now, the next tick re-engages with the new mode.
-                    ReleaseClocks();
-                    if (cfg.ControlMode != ControlMode.Auto) _clockUnsupported = false;
+                    foreach (var lane in _lanes.Values)
+                    {
+                        if (lane.Active != ActiveMode.None && !ReleaseLane(lane)) continue;
+                        lane.ClockUnsupported = false;
+                        lane.Notice = null;
+                    }
                 }
-                else if (cfg.AutoCoolEnabled && LastState is GpuState s)
+                else if (cfg.AutoCoolEnabled)
                 {
-                    if (_active == ActiveMode.Clock && _currentCap > ClockCeiling(cfg, s)) SetCap(ClockCeiling(cfg, s), s);
-                    if (_active == ActiveMode.Power && _currentPowerCap > PowerCeiling(cfg, s)) SetPowerCap(PowerCeiling(cfg, s));
+                    foreach (var lane in _lanes.Values)
+                    {
+                        if (lane.State is not GpuState s) continue;
+                        if (lane.Active == ActiveMode.Clock && lane.CurrentCap > ClockCeiling(cfg, s))
+                            SetCap(lane, ClockCeiling(cfg, s), s);
+                        if (lane.Active == ActiveMode.Power && lane.CurrentPowerCap > PowerCeiling(cfg, s))
+                            SetPowerCap(lane, PowerCeiling(cfg, s));
+                    }
                 }
+                LastError = null;
             }
             catch (Exception ex) { LastError = ex.Message; }
         }
@@ -142,13 +113,14 @@ public sealed class GuardEngine : IDisposable
             lock (_lock) cfg = _cfg;
             try
             {
-                var s = Nvidia.Query(cfg.GpuIndex);
-                LastState = s;
-                LastError = null;
-                if (cfg.AutoCoolEnabled) Step(cfg, s);
-                else LastAction = "off";
+                if (cfg.ControlAllGpus) TickAll();
+                else TickOne(cfg.GpuIndex);
             }
-            catch (Exception ex) { LastError = ex.Message; }
+            catch (Exception ex)
+            {
+                lock (_lock) LastError = ex.Message;
+                Log(ex.Message);
+            }
             Updated?.Invoke();
             try { Task.Delay(TimeSpan.FromSeconds(Math.Max(1, cfg.CheckIntervalSec)), ct).Wait(ct); }
             catch (OperationCanceledException) { }
@@ -156,17 +128,140 @@ public sealed class GuardEngine : IDisposable
         }
     }
 
+    private void TickAll()
+    {
+        var states = Nvidia.QueryAll();
+        if (states.Length == 0) throw new InvalidOperationException("未检测到 GPU");
+        lock (_lock)
+        {
+            if (!_cfg.ControlAllGpus) return;
+            var indices = states.Select(s => s.Index).Distinct().OrderBy(i => i).ToArray();
+            RetainOnly(indices);
+            NoteSet(indices);
+            foreach (var s in states) ApplySample(s);
+            LastError = null;
+        }
+    }
+
+    private void TickOne(int index)
+    {
+        var s = Nvidia.Query(index);
+        lock (_lock)
+        {
+            if (_cfg.ControlAllGpus || _cfg.GpuIndex != index) return;
+            RetainOnly([index]);
+            NoteSet([index]);
+            ApplySample(s);
+            LastError = null;
+        }
+    }
+
+    /// <summary>Caller holds <see cref="_lock"/>.</summary>
+    private void ApplySample(GpuState s)
+    {
+        var lane = GetLane(s.Index);
+        lane.State = s;
+        try
+        {
+            if (!_cfg.AutoCoolEnabled)
+            {
+                // A failed release keeps the cap so the next tick, and shutdown, can retry.
+                if (NeedsRelease(lane) && !ReleaseLane(lane)) return;
+                lane.LastError = null;
+                lane.LastAction = "off";
+                return;
+            }
+            lane.LastError = null;
+            Step(lane, s);
+        }
+        catch (Exception ex)
+        {
+            lane.LastError = ex.Message;
+            Log($"GPU #{s.Index}: {ex.Message}");
+        }
+    }
+
+    private int[] IndicesFor(Config cfg)
+    {
+        if (!cfg.ControlAllGpus) return [cfg.GpuIndex];
+        try
+        {
+            var present = Nvidia.ListIndices();
+            if (present.Length > 0) return present;
+        }
+        catch (Exception ex) { Log("list GPUs failed: " + ex.Message); }
+        return _lanes.Count > 0 ? _lanes.Keys.OrderBy(i => i).ToArray() : [cfg.GpuIndex];
+    }
+
+    /// <summary>
+    /// Release cards that are no longer selected. A card whose reset or power restore failed
+    /// stays in the table: the error remains visible, later ticks retry, and shutdown can try again.
+    /// Caller holds <see cref="_lock"/>.
+    /// </summary>
+    private void RetainOnly(int[] indices)
+    {
+        var keep = indices.ToHashSet();
+        foreach (var lane in _lanes.Values.ToList())
+        {
+            if (keep.Contains(lane.Index)) continue;
+            if (ReleaseLane(lane)) _lanes.Remove(lane.Index);
+        }
+    }
+
+    private void NoteSet(int[] indices)
+    {
+        var key = string.Join(",", indices);
+        if (key == _loggedSet) return;
+        _loggedSet = key;
+        Log("controlling GPUs: " + key);
+    }
+
+    private Lane GetLane(int index)
+    {
+        if (!_lanes.TryGetValue(index, out var lane))
+            _lanes[index] = lane = new Lane { Index = index };
+        return lane;
+    }
+
+    private bool LaneThrottling(Lane lane)
+    {
+        if (!_cfg.AutoCoolEnabled || lane.State is not GpuState s) return false;
+        return lane.Active switch
+        {
+            ActiveMode.Clock => lane.CurrentCap > 0 && lane.CurrentCap < ClockCeiling(_cfg, s),
+            ActiveMode.Power => lane.CurrentPowerCap > 0 && lane.CurrentPowerCap < PowerCeiling(_cfg, s),
+            _ => false,
+        };
+    }
+
+    private GpuReport ToReport(Lane lane)
+    {
+        var s = lane.State;
+        var cap = lane.Active switch
+        {
+            ActiveMode.Clock => $"{lane.CurrentCap} MHz  (上限 {(s != null ? ClockCeiling(_cfg, s) : _cfg.ClockCeilingMHz)} MHz, 下限 {(s != null ? ClockFloor(_cfg, s) : _cfg.ClockFloorMHz)} MHz)",
+            ActiveMode.Power => $"{lane.CurrentPowerCap} W  (上限 {(s != null ? PowerCeiling(_cfg, s) : _cfg.PowerLimitW)} W, 下限 {(s != null ? PowerFloor(_cfg, s) : _cfg.PowerFloorW)} W)",
+            _ => "未干预",
+        };
+        var cfgMode = _cfg.ControlMode switch { ControlMode.Clock => "锁频", ControlMode.Power => "限功耗", _ => "自动" };
+        var act = lane.Active switch { ActiveMode.Clock => "锁频", ActiveMode.Power => "限功耗", _ => _cfg.AutoCoolEnabled ? "待探测" : "—" };
+        var hint = lane.ClockUnsupported ? "，本卡不支持锁频" : "";
+        return new GpuReport(
+            lane.Index, s, lane.Active, lane.CurrentCap, lane.CurrentPowerCap, lane.LastAction,
+            lane.LastError, lane.Notice, LaneThrottling(lane), cap, $"{cfgMode} → 实际: {act}{hint}");
+    }
+
     // ---------- effective ranges (config clamped to what the card reports) ----------
 
-    private int ClockCeiling(Config cfg, GpuState s) =>
+    private static int ClockCeiling(Config cfg, GpuState s) =>
         s.MaxClockMHz > 0 ? Math.Min(cfg.ClockCeilingMHz, s.MaxClockMHz) : cfg.ClockCeilingMHz;
 
-    private int ClockFloor(Config cfg, GpuState s) => Math.Min(cfg.ClockFloorMHz, ClockCeiling(cfg, s));
+    private static int ClockFloor(Config cfg, GpuState s) => Math.Min(cfg.ClockFloorMHz, ClockCeiling(cfg, s));
 
-    private int ClockLockMin(Config cfg, GpuState s)
+    private static int ClockLockMin(Config cfg, Lane lane, GpuState s)
     {
         var min = cfg.ClockLockMinMHz;
-        if (_minSupportedMHz is int sup && sup > min) min = sup;   // e.g. 210 MHz on RTX 30 series
+        if (lane.MinSupportedMHz is int sup && sup > min) min = sup;
         return Math.Min(min, ClockFloor(cfg, s));
     }
 
@@ -186,28 +281,28 @@ public sealed class GuardEngine : IDisposable
         return Math.Min(Math.Max(1, f), PowerCeiling(cfg, s));
     }
 
-    // ---------- control ----------
+    // ---------- control (caller holds _lock) ----------
 
-    private void Step(Config cfg, GpuState s)
+    private void Step(Lane lane, GpuState s)
     {
-        lock (_lock)
-        {
-            if (_active == ActiveMode.None) Engage(cfg, s);
+        var cfg = _cfg;
+        if (lane.Active == ActiveMode.None) Engage(lane, s);
 
-            if (_active == ActiveMode.Clock)
-            {
-                var floor = ClockFloor(cfg, s); var ceiling = ClockCeiling(cfg, s);
-                var (desired, action) = Decide(cfg, s.TempC, _currentCap, floor, ceiling, cfg.StepDownMHz, cfg.StepUpMHz);
-                if (desired != _currentCap) SetCap(desired, s);
-                LastAction = action;
-            }
-            else if (_active == ActiveMode.Power)
-            {
-                var floor = PowerFloor(cfg, s); var ceiling = PowerCeiling(cfg, s);
-                var (desired, action) = Decide(cfg, s.TempC, _currentPowerCap, floor, ceiling, cfg.PowerStepDownW, cfg.PowerStepUpW);
-                if (desired != _currentPowerCap) SetPowerCap(desired);
-                LastAction = action;
-            }
+        if (lane.Active == ActiveMode.Clock)
+        {
+            var floor = ClockFloor(cfg, s);
+            var ceiling = ClockCeiling(cfg, s);
+            var (desired, action) = Decide(cfg, s.TempC, lane.CurrentCap, floor, ceiling, cfg.StepDownMHz, cfg.StepUpMHz);
+            if (desired != lane.CurrentCap) SetCap(lane, desired, s);
+            lane.LastAction = action;
+        }
+        else if (lane.Active == ActiveMode.Power)
+        {
+            var floor = PowerFloor(cfg, s);
+            var ceiling = PowerCeiling(cfg, s);
+            var (desired, action) = Decide(cfg, s.TempC, lane.CurrentPowerCap, floor, ceiling, cfg.PowerStepDownW, cfg.PowerStepUpW);
+            if (desired != lane.CurrentPowerCap) SetPowerCap(lane, desired);
+            lane.LastAction = action;
         }
     }
 
@@ -219,96 +314,116 @@ public sealed class GuardEngine : IDisposable
         return (Math.Clamp(current, floor, ceiling), current == Math.Clamp(current, floor, ceiling) ? "hold" : "clamp");
     }
 
-    /// <summary>First tick after enabling: pick and engage a lever, honouring ControlMode and what the card supports.</summary>
-    private void Engage(Config cfg, GpuState s)
+    private void Engage(Lane lane, GpuState s)
     {
-        if (_probedGpu != cfg.GpuIndex)
+        var cfg = _cfg;
+        if (!lane.Probed)
         {
-            _minSupportedMHz = Nvidia.MinSupportedGraphicsMHz(cfg.GpuIndex);
-            _probedGpu = cfg.GpuIndex;
-            Log($"GPU #{s.Index} {s.Name}: driver={s.DriverModel} maxClock={s.MaxClockMHz}MHz minSupported={_minSupportedMHz?.ToString() ?? "N/A"} power={s.MinLimitW}-{s.MaxLimitW}W default={s.DefaultLimitW}W");
+            lane.MinSupportedMHz = Nvidia.MinSupportedGraphicsMHz(lane.Index);
+            lane.Probed = true;
+            Log($"GPU #{s.Index} {s.Name}: driver={s.DriverModel} maxClock={s.MaxClockMHz}MHz minSupported={lane.MinSupportedMHz?.ToString() ?? "N/A"} power={s.MinLimitW}-{s.MaxLimitW}W default={s.DefaultLimitW}W");
         }
 
         var mode = cfg.ControlMode;
-        if (mode == ControlMode.Auto) mode = _clockUnsupported ? ControlMode.Power : ControlMode.Clock;
+        if (mode == ControlMode.Auto) mode = lane.ClockUnsupported ? ControlMode.Power : ControlMode.Clock;
 
         if (mode == ControlMode.Clock)
         {
-            try { EngageClock(cfg, s); return; }
+            try { EngageClock(lane, s); return; }
             catch (Exception ex) when (cfg.ControlMode == ControlMode.Auto)
             {
-                // Auto: the card refused clock locking -> remember and try the power limit instead.
-                _clockUnsupported = true;
-                try { Nvidia.ResetClocks(cfg.GpuIndex); } catch { }
-                _currentCap = 0;
-                Notice = $"本卡不支持锁频，已自动切换为限功耗降温。({Shorten(ex.Message)})";
-                Log("clock lock unsupported, falling back to power limit: " + ex.Message);
+                lane.ClockUnsupported = true;
+                try { Nvidia.ResetClocks(lane.Index); } catch { }
+                lane.CurrentCap = 0;
+                lane.Notice = $"本卡不支持锁频，已自动切换为限功耗降温。({Shorten(ex.Message)})";
+                Log($"GPU #{lane.Index} clock lock unsupported, falling back to power limit: " + ex.Message);
             }
         }
 
-        try { EngagePower(cfg, s); }
+        try { EngagePower(lane, s); }
         catch (Exception ex)
         {
-            Log("power limit failed: " + ex.Message);
-            if (_clockUnsupported && cfg.ControlMode == ControlMode.Auto)
+            Log($"GPU #{lane.Index} power limit failed: " + ex.Message);
+            if (lane.ClockUnsupported && cfg.ControlMode == ControlMode.Auto)
                 throw new InvalidOperationException("锁频和限功耗都失败，本卡/驱动无法通过 nvidia-smi 控制。请确认以管理员运行、驱动为最新版。\n" + ex.Message);
             throw;
         }
     }
 
-    private void EngageClock(Config cfg, GpuState s)
+    private void EngageClock(Lane lane, GpuState s)
     {
-        // Optional one-time power-limit safety cap; not fatal if the card refuses it.
-        if (cfg.PowerLimitW > 0 && _restorePowerW == null)
+        var cfg = _cfg;
+        if (cfg.PowerLimitW > 0 && lane.RestorePowerW == null)
         {
             try
             {
                 var pw = Math.Clamp(cfg.PowerLimitW, Math.Max(1, s.MinLimitW), Math.Max(PowerMax(s), s.MinLimitW));
-                Nvidia.SetPowerLimit(cfg.GpuIndex, pw);
-                _restorePowerW = s.DefaultLimitW > 0 ? s.DefaultLimitW : PowerMax(s);
+                Nvidia.SetPowerLimit(lane.Index, pw);
+                lane.RestorePowerW = s.DefaultLimitW > 0 ? s.DefaultLimitW : PowerMax(s);
             }
-            catch (Exception ex) { Notice = "功耗安全上限设置失败，仅使用锁频: " + Shorten(ex.Message); Log("safety power cap failed: " + ex.Message); }
+            catch (Exception ex)
+            {
+                lane.Notice = "功耗安全上限设置失败，仅使用锁频: " + Shorten(ex.Message);
+                Log($"GPU #{lane.Index} safety power cap failed: " + ex.Message);
+            }
         }
-        SetCap(ClockCeiling(cfg, s), s);
-        _active = ActiveMode.Clock;
-        Log($"engaged clock lock: {ClockLockMin(cfg, s)}-{_currentCap} MHz");
+        SetCap(lane, ClockCeiling(cfg, s), s);
+        lane.Active = ActiveMode.Clock;
+        Log($"GPU #{lane.Index} engaged clock lock: {ClockLockMin(cfg, lane, s)}-{lane.CurrentCap} MHz");
     }
 
-    private void EngagePower(Config cfg, GpuState s)
+    private void EngagePower(Lane lane, GpuState s)
     {
-        _restorePowerW ??= s.DefaultLimitW > 0 ? s.DefaultLimitW : PowerMax(s);
-        SetPowerCap(PowerCeiling(cfg, s));
-        _active = ActiveMode.Power;
-        Log($"engaged power limit: {_currentPowerCap} W (range {PowerFloor(cfg, s)}-{PowerCeiling(cfg, s)} W)");
+        var cfg = _cfg;
+        lane.RestorePowerW ??= s.DefaultLimitW > 0 ? s.DefaultLimitW : PowerMax(s);
+        SetPowerCap(lane, PowerCeiling(cfg, s));
+        lane.Active = ActiveMode.Power;
+        Log($"GPU #{lane.Index} engaged power limit: {lane.CurrentPowerCap} W (range {PowerFloor(cfg, s)}-{PowerCeiling(cfg, s)} W)");
     }
 
-    private void SetCap(int maxMHz, GpuState s)
+    private void SetCap(Lane lane, int maxMHz, GpuState s)
     {
-        Nvidia.LockClocks(_cfg.GpuIndex, ClockLockMin(_cfg, s), maxMHz);
-        _currentCap = maxMHz;
+        Nvidia.LockClocks(lane.Index, ClockLockMin(_cfg, lane, s), maxMHz);
+        lane.CurrentCap = maxMHz;
     }
 
-    private void SetPowerCap(int watts)
+    private void SetPowerCap(Lane lane, int watts)
     {
-        Nvidia.SetPowerLimit(_cfg.GpuIndex, watts);
-        _currentPowerCap = watts;
+        Nvidia.SetPowerLimit(lane.Index, watts);
+        lane.CurrentPowerCap = watts;
     }
 
-    private void ReleaseClocks() => ReleaseWith(_cfg);
-
-    private void ReleaseWith(Config cfg)
+    /// <summary>Returns true only after clocks and the saved power limit are actually restored.</summary>
+    private bool ReleaseLane(Lane lane)
     {
         try
         {
-            if (_currentCap != 0) Nvidia.ResetClocks(cfg.GpuIndex);
-            if (_restorePowerW is int w) { Nvidia.SetPowerLimit(cfg.GpuIndex, w); _restorePowerW = null; }
+            if (lane.CurrentCap != 0)
+            {
+                Nvidia.ResetClocks(lane.Index);
+                lane.CurrentCap = 0;
+            }
+            if (lane.RestorePowerW is int w)
+            {
+                Nvidia.SetPowerLimit(lane.Index, w);
+                lane.RestorePowerW = null;
+            }
+            lane.CurrentPowerCap = 0;
+            lane.Active = ActiveMode.None;
+            lane.LastAction = "off";
+            lane.LastError = null;
+            return true;
         }
-        catch (Exception ex) { LastError = ex.Message; Log("release failed: " + ex.Message); }
-        _currentCap = 0;
-        _currentPowerCap = 0;
-        _active = ActiveMode.None;
-        LastAction = "off";
+        catch (Exception ex)
+        {
+            // Leave CurrentCap / RestorePowerW in place so a later call retries the failed step.
+            lane.LastError = ex.Message;
+            Log($"GPU #{lane.Index} release failed: " + ex.Message);
+            return false;
+        }
     }
+
+    private static bool NeedsRelease(Lane lane) => lane.CurrentCap != 0 || lane.RestorePowerW != null;
 
     private static string Shorten(string msg)
     {
@@ -333,6 +448,25 @@ public sealed class GuardEngine : IDisposable
     {
         _cts?.Cancel();
         try { _loop?.Wait(3000); } catch { }
-        lock (_lock) ReleaseClocks();
+        lock (_lock)
+        {
+            foreach (var lane in _lanes.Values.ToList()) ReleaseLane(lane);
+        }
+    }
+
+    private sealed class Lane
+    {
+        public int Index;
+        public ActiveMode Active;
+        public int CurrentCap;
+        public int CurrentPowerCap;
+        public int? RestorePowerW;
+        public bool ClockUnsupported;
+        public bool Probed;
+        public int? MinSupportedMHz;
+        public GpuState? State;
+        public string LastAction = "idle";
+        public string? LastError;
+        public string? Notice;
     }
 }

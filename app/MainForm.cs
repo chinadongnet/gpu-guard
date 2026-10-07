@@ -7,21 +7,17 @@ public sealed class MainForm : Form
     private readonly NotifyIcon _tray;
     private Icon? _trayIcon;
 
-    // Live data labels
-    private readonly Label _lblName = new();
-    private readonly Label _lblTemp = new();
-    private readonly Label _lblClock = new();
-    private readonly Label _lblPower = new();
-    private readonly Label _lblFan = new();
-    private readonly Label _lblUtil = new();
-    private readonly Label _lblMem = new();
-    private readonly Label _lblMode = new();
-    private readonly Label _lblCap = new();
-    private readonly Label _lblAction = new();
-    private readonly Label _lblNotice = new();
-    private readonly Label _lblError = new();
+    private readonly FlowLayoutPanel _liveHost = new()
+    {
+        FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+        Dock = DockStyle.Top, MinimumSize = new Size(420, 0),
+    };
+    private readonly Label _lblPlaceholder = new() { AutoSize = true, ForeColor = Color.DimGray, Text = "正在读取显卡…" };
+    private readonly Label _lblError = new() { ForeColor = Color.Firebrick, AutoSize = true, MaximumSize = new Size(420, 0) };
+    private readonly Dictionary<int, GpuCardUi> _cards = new();
 
-    private readonly CheckBox _chkAuto = new() { Text = "启用自动 GPU 降温（锁频）", AutoSize = true, Font = new Font("Microsoft YaHei UI", 10, FontStyle.Bold) };
+    private readonly CheckBox _chkAuto = new() { Text = "启用自动 GPU 降温", AutoSize = true, Font = new Font("Microsoft YaHei UI", 10, FontStyle.Bold) };
+    private readonly CheckBox _chkAll = new() { Text = "控制全部 GPU（各卡按自己的温度，共用一套规则）", AutoSize = true };
     private readonly CheckBox _chkAutostart = new() { Text = "开机自动启动（计划任务，管理员权限）", AutoSize = true };
     private readonly ToolStripMenuItem _menuAuto = new("自动降温");
     private readonly ToolStripMenuItem _menuProfile = new("降温策略");
@@ -96,27 +92,11 @@ public sealed class MainForm : Form
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(12), AutoScroll = true };
         Controls.Add(root);
 
-        // Live data
+        // Live data — one card per GPU, rebuilt as the set changes.
         var live = new GroupBox { Text = "GPU 实时数据", Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(8) };
-        var lt = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top };
-        lt.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
-        lt.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        AddRow(lt, "显卡", _lblName);
-        AddRow(lt, "温度", _lblTemp);
-        AddRow(lt, "核心频率", _lblClock);
-        AddRow(lt, "功耗", _lblPower);
-        AddRow(lt, "风扇", _lblFan);
-        AddRow(lt, "占用率", _lblUtil);
-        AddRow(lt, "显存", _lblMem);
-        AddRow(lt, "控制方式", _lblMode);
-        AddRow(lt, "当前限制", _lblCap);
-        AddRow(lt, "当前动作", _lblAction);
-        _lblNotice.ForeColor = Color.DarkOrange; _lblNotice.AutoSize = true; _lblNotice.MaximumSize = new Size(400, 0);
-        lt.Controls.Add(_lblNotice); lt.SetColumnSpan(_lblNotice, 2);
-        _lblError.ForeColor = Color.Firebrick; _lblError.AutoSize = true; _lblError.MaximumSize = new Size(400, 0);
-        lt.Controls.Add(_lblError); lt.SetColumnSpan(_lblError, 2);
-        _lblTemp.Font = new Font("Microsoft YaHei UI", 14, FontStyle.Bold);
-        live.Controls.Add(lt);
+        _liveHost.Controls.Add(_lblPlaceholder);
+        _liveHost.Controls.Add(_lblError);
+        live.Controls.Add(_liveHost);
         root.Controls.Add(live);
 
         // Toggle
@@ -142,6 +122,9 @@ public sealed class MainForm : Form
         rt.Controls.Add(new Label { Text = "控制方式", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 0, 0) });
         foreach (var m in Config.ControlModes) _cmbMode.Items.Add(m.Label);
         rt.Controls.Add(_cmbMode); rt.SetColumnSpan(_cmbMode, 3);
+        _chkAll.Margin = new Padding(0, 8, 0, 0);
+        _chkAll.CheckedChanged += (_, _) => { if (!_loadingUi) OnAllGpusToggled(); };
+        rt.Controls.Add(_chkAll); rt.SetColumnSpan(_chkAll, 4);
         AddPair(rt, "GPU 序号", _numGpu, "检测间隔 (秒)", _numInterval);
         AddPair(rt, "降温温度 (°C) >", _numTarget, "恢复温度 (°C) ≤", _numCool);
         AddPair(rt, "紧急温度 (°C) ≥", _numCritical, "", null);
@@ -155,7 +138,8 @@ public sealed class MainForm : Form
         var help = new Label
         {
             AutoSize = true, MaximumSize = new Size(410, 0), ForeColor = Color.DimGray,
-            Text = "逻辑：温度 > 降温温度 → 每次检测把限制下调一个步进；≥ 紧急温度 → 下调 3 倍步进；≤ 恢复温度 → 上调一个步进，直至上限；永远不低于下限。" +
+            Text = "勾选「控制全部 GPU」时，每块卡按自己的温度独立调整，共用下面这套规则。取消后只控制「GPU 序号」那一块。" +
+                   "逻辑：温度 > 降温温度 → 每次检测把限制下调一个步进；≥ 紧急温度 → 下调 3 倍步进；≤ 恢复温度 → 上调一个步进，直至上限；永远不低于下限。" +
                    "锁频模式用频率参数（上限自动钳到显卡最高频率，锁频最低自动钳到显卡支持的最低频率）；" +
                    "限功耗模式用功耗参数（0 = 使用显卡默认/最低功耗限制）。GeForce 卡（如 RTX 3090）在 Windows 下通常不支持锁频，「自动」会改用限功耗。" +
                    "锁频模式下功耗上限 > 0 时作为一次性安全上限。",
@@ -177,13 +161,6 @@ public sealed class MainForm : Form
         root.Controls.Add(cfgPath);
     }
 
-    private static void AddRow(TableLayoutPanel t, string caption, Label value)
-    {
-        t.Controls.Add(new Label { Text = caption, AutoSize = true, ForeColor = Color.DimGray, Anchor = AnchorStyles.Left, Margin = new Padding(0, 4, 0, 4) });
-        value.AutoSize = true; value.Anchor = AnchorStyles.Left; value.Margin = new Padding(0, 4, 0, 4);
-        t.Controls.Add(value);
-    }
-
     private static void AddPair(TableLayoutPanel t, string c1, NumericUpDown n1, string c2, NumericUpDown? n2)
     {
         t.Controls.Add(new Label { Text = c1, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 0, 0) });
@@ -197,6 +174,8 @@ public sealed class MainForm : Form
     private void LoadConfigToUi(Config c)
     {
         _loadingUi = true;
+        _chkAll.Checked = c.ControlAllGpus;
+        _numGpu.Enabled = !c.ControlAllGpus;
         _numGpu.Value = c.GpuIndex; _numTarget.Value = c.TargetTempC; _numCool.Value = c.CoolTempC;
         _numCritical.Value = c.CriticalTempC; _numInterval.Value = c.CheckIntervalSec;
         _numCeiling.Value = c.ClockCeilingMHz; _numFloor.Value = c.ClockFloorMHz; _numLockMin.Value = c.ClockLockMinMHz;
@@ -212,6 +191,7 @@ public sealed class MainForm : Form
 
     private Config ReadUiConfig() => new()
     {
+        ControlAllGpus = _chkAll.Checked,
         GpuIndex = (int)_numGpu.Value, TargetTempC = (int)_numTarget.Value, CoolTempC = (int)_numCool.Value,
         CriticalTempC = (int)_numCritical.Value, CheckIntervalSec = (int)_numInterval.Value,
         ClockCeilingMHz = (int)_numCeiling.Value, ClockFloorMHz = (int)_numFloor.Value, ClockLockMinMHz = (int)_numLockMin.Value,
@@ -257,6 +237,12 @@ public sealed class MainForm : Form
         RefreshAll();
     }
 
+    private void OnAllGpusToggled()
+    {
+        _numGpu.Enabled = !_chkAll.Checked;
+        SaveRules();
+    }
+
     private void OnAutoToggled()
     {
         var c = _engine.Config.Clone();
@@ -280,52 +266,126 @@ public sealed class MainForm : Form
 
     private void RefreshAll()
     {
-        var s = _engine.LastState;
         var cfg = _engine.Config;
-        if (s != null)
+        var reports = _engine.Reports;
+        var seen = new HashSet<int>();
+        foreach (var r in reports)
         {
-            _lblName.Text = $"#{s.Index}  {s.Name}";
-            _lblTemp.Text = $"{s.TempC} °C";
-            _lblTemp.ForeColor = s.TempC >= cfg.CriticalTempC ? Color.Firebrick : s.TempC > cfg.TargetTempC ? Color.DarkOrange : Color.ForestGreen;
-            _lblClock.Text = $"{s.ClockSmMHz} MHz";
-            _lblPower.Text = $"{s.PowerDrawW:N1} W  (限制范围 {s.MinLimitW}–{s.MaxLimitW} W)";
-            _lblFan.Text = $"{s.FanPct} %";
-            _lblUtil.Text = $"{s.UtilPct} %";
-            _lblMem.Text = $"{s.MemUsedMiB} / {s.MemTotalMiB} MiB";
+            seen.Add(r.Index);
+            if (!_cards.TryGetValue(r.Index, out var ui))
+            {
+                ui = GpuCardUi.Create();
+                _cards[r.Index] = ui;
+                var errorAt = _liveHost.Controls.IndexOf(_lblError);
+                _liveHost.Controls.Add(ui.Panel);
+                _liveHost.Controls.SetChildIndex(ui.Panel, errorAt < 0 ? _liveHost.Controls.Count - 1 : errorAt);
+            }
+            ui.Update(r, cfg);
         }
-        _lblMode.Text = _engine.ModeText;
-        _lblCap.Text = _engine.CapText;
-        var power = _engine.Active == ActiveMode.Power;
-        _lblAction.Text = _engine.LastAction switch
+        foreach (var index in _cards.Keys.Where(i => !seen.Contains(i)).ToList())
         {
-            "drop" => power ? "降功耗中" : "降频中",
-            "critical-drop" => power ? "紧急降功耗中" : "紧急降频中",
-            "raise" => power ? "升功耗中" : "升频中",
-            "hold" => "保持", "clamp" => "钳位到范围内", "off" => "自动降温已关闭", _ => _engine.LastAction,
-        };
-        _lblNotice.Text = _engine.Notice ?? "";
-        _lblError.Text = _engine.LastError ?? "";
+            _liveHost.Controls.Remove(_cards[index].Panel);
+            _cards[index].Panel.Dispose();
+            _cards.Remove(index);
+        }
+        _lblPlaceholder.Visible = reports.Count == 0;
+        _lblPlaceholder.Text = _engine.LastError ?? "正在读取显卡…";
+        _lblError.Text = reports.Count == 0 ? "" : _engine.LastError ?? "";
         if (_menuAuto.Checked != cfg.AutoCoolEnabled) _menuAuto.Checked = cfg.AutoCoolEnabled;
         RefreshTray();
     }
 
     private void RefreshTray()
     {
-        var s = _engine.LastState;
+        var reports = _engine.Reports;
         var cfg = _engine.Config;
-        var icon = TrayIconRenderer.Render(s?.TempC, _engine.IsThrottling, cfg.AutoCoolEnabled, _engine.LastError != null, cfg.TargetTempC, cfg.CriticalTempC);
+        var known = reports.Where(r => r.State != null).ToList();
+        int? temp = known.Count == 0 ? null : known.Max(r => r.State!.TempC);
+        var throttling = reports.Any(r => r.IsThrottling);
+        // Cached samples must not hide a later query failure or a per-GPU control error.
+        var error = _engine.LastError != null || reports.Any(r => r.LastError != null);
+        var icon = TrayIconRenderer.Render(temp, throttling, cfg.AutoCoolEnabled, error, cfg.TargetTempC, cfg.CriticalTempC);
         var old = _trayIcon;
         _tray.Icon = icon; _trayIcon = icon;
         old?.Dispose();
-        var tip = s == null ? "GPU Guard" :
-            $"GPU {s.TempC}°C  {s.ClockSmMHz}MHz  {s.PowerDrawW:N0}W\n" +
-            (cfg.AutoCoolEnabled
-                ? (_engine.IsThrottling
-                    ? (_engine.Active == ActiveMode.Power ? $"降温中 限{_engine.CurrentPowerCapW}W" : $"降温中 上限{_engine.CurrentCapMHz}MHz")
-                    : "自动降温：开")
-                : "自动降温：关") +
-            $" ≤{cfg.TargetTempC}°C";
+        string tip;
+        if (known.Count == 0) tip = error ? "GPU Guard 异常" : "GPU Guard";
+        else
+        {
+            var head = string.Join(" ", known.Select(r => $"#{r.Index} {r.State!.TempC}°"));
+            var tail = error ? "异常" : !cfg.AutoCoolEnabled ? "关" : throttling ? "降温中" : "开";
+            tip = $"{head} {tail} ≤{cfg.TargetTempC}°";
+        }
         _tray.Text = tip.Length > 63 ? tip[..63] : tip;
+    }
+
+    private static string ActionText(string action, bool power) => action switch
+    {
+        "drop" => power ? "降功耗中" : "降频中",
+        "critical-drop" => power ? "紧急降功耗中" : "紧急降频中",
+        "raise" => power ? "升功耗中" : "升频中",
+        "hold" => "保持",
+        "clamp" => "钳位到范围内",
+        "off" => "自动降温已关闭",
+        _ => action,
+    };
+
+    /// <summary>One GPU's live block inside the status panel.</summary>
+    private sealed class GpuCardUi
+    {
+        public Panel Panel { get; }
+        private readonly Label _name = new() { AutoSize = true, Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold) };
+        private readonly Label _temp = new() { AutoSize = true, Font = new Font("Microsoft YaHei UI", 14, FontStyle.Bold) };
+        private readonly Label _detail = new() { AutoSize = true, MaximumSize = new Size(420, 0) };
+        private readonly Label _mode = new() { AutoSize = true, MaximumSize = new Size(420, 0) };
+        private readonly Label _cap = new() { AutoSize = true, MaximumSize = new Size(420, 0) };
+        private readonly Label _action = new() { AutoSize = true };
+        private readonly Label _notice = new() { AutoSize = true, MaximumSize = new Size(420, 0), ForeColor = Color.DarkOrange };
+        private readonly Label _error = new() { AutoSize = true, MaximumSize = new Size(420, 0), ForeColor = Color.Firebrick };
+
+        private GpuCardUi(Panel panel) { Panel = panel; }
+
+        public static GpuCardUi Create()
+        {
+            var ui = new GpuCardUi(new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 10), MinimumSize = new Size(420, 0),
+            });
+            var host = (FlowLayoutPanel)ui.Panel;
+            host.Controls.Add(ui._name);
+            host.Controls.Add(ui._temp);
+            host.Controls.Add(ui._detail);
+            host.Controls.Add(ui._mode);
+            host.Controls.Add(ui._cap);
+            host.Controls.Add(ui._action);
+            host.Controls.Add(ui._notice);
+            host.Controls.Add(ui._error);
+            return ui;
+        }
+
+        public void Update(GpuReport r, Config cfg)
+        {
+            var s = r.State;
+            _name.Text = s == null ? $"GPU #{r.Index}" : $"GPU #{s.Index}  {s.Name}";
+            if (s == null)
+            {
+                _temp.Text = "--";
+                _temp.ForeColor = Color.DimGray;
+                _detail.Text = "";
+            }
+            else
+            {
+                _temp.Text = $"{s.TempC} °C";
+                _temp.ForeColor = s.TempC >= cfg.CriticalTempC ? Color.Firebrick : s.TempC > cfg.TargetTempC ? Color.DarkOrange : Color.ForestGreen;
+                _detail.Text = $"{s.ClockSmMHz} MHz · {s.PowerDrawW:N1} W（限制 {s.MinLimitW}–{s.MaxLimitW}）· 风扇 {s.FanPct}% · 占用 {s.UtilPct}% · 显存 {s.MemUsedMiB}/{s.MemTotalMiB} MiB";
+            }
+            _mode.Text = "控制方式  " + r.ModeText;
+            _cap.Text = "当前限制  " + r.CapText;
+            _action.Text = "当前动作  " + ActionText(r.LastAction, r.Active == ActiveMode.Power);
+            _notice.Text = r.Notice ?? "";
+            _error.Text = r.LastError ?? "";
+        }
     }
 
     // ---------- window behaviour ----------
