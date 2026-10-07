@@ -302,17 +302,18 @@ public sealed class MainForm : Form
         var known = reports.Where(r => r.State != null).ToList();
         int? temp = known.Count == 0 ? null : known.Max(r => r.State!.TempC);
         var throttling = reports.Any(r => r.IsThrottling);
-        var error = known.Count == 0 && (reports.Any(r => r.LastError != null) || _engine.LastError != null);
+        // Cached samples must not hide a later query failure or a per-GPU control error.
+        var error = _engine.LastError != null || reports.Any(r => r.LastError != null);
         var icon = TrayIconRenderer.Render(temp, throttling, cfg.AutoCoolEnabled, error, cfg.TargetTempC, cfg.CriticalTempC);
         var old = _trayIcon;
         _tray.Icon = icon; _trayIcon = icon;
         old?.Dispose();
         string tip;
-        if (known.Count == 0) tip = "GPU Guard";
+        if (known.Count == 0) tip = error ? "GPU Guard 异常" : "GPU Guard";
         else
         {
             var head = string.Join(" ", known.Select(r => $"#{r.Index} {r.State!.TempC}°"));
-            var tail = !cfg.AutoCoolEnabled ? "关" : throttling ? "降温中" : "开";
+            var tail = error ? "异常" : !cfg.AutoCoolEnabled ? "关" : throttling ? "降温中" : "开";
             tip = $"{head} {tail} ≤{cfg.TargetTempC}°";
         }
         _tray.Text = tip.Length > 63 ? tip[..63] : tip;

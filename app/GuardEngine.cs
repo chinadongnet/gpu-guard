@@ -75,7 +75,7 @@ public sealed class GuardEngine : IDisposable
                 {
                     foreach (var lane in _lanes.Values)
                     {
-                        if (lane.Active != ActiveMode.None) ReleaseLane(lane);
+                        if (lane.Active != ActiveMode.None && !ReleaseLane(lane)) continue;
                         lane.ClockUnsupported = false;
                         lane.Notice = null;
                     }
@@ -163,9 +163,16 @@ public sealed class GuardEngine : IDisposable
         lane.State = s;
         try
         {
+            if (!_cfg.AutoCoolEnabled)
+            {
+                // A failed release keeps the cap so the next tick, and shutdown, can retry.
+                if (NeedsRelease(lane) && !ReleaseLane(lane)) return;
+                lane.LastError = null;
+                lane.LastAction = "off";
+                return;
+            }
             lane.LastError = null;
-            if (_cfg.AutoCoolEnabled) Step(lane, s);
-            else lane.LastAction = "off";
+            Step(lane, s);
         }
         catch (Exception ex)
         {
@@ -186,15 +193,18 @@ public sealed class GuardEngine : IDisposable
         return _lanes.Count > 0 ? _lanes.Keys.OrderBy(i => i).ToArray() : [cfg.GpuIndex];
     }
 
-    /// <summary>Release cards that are no longer selected. Caller holds <see cref="_lock"/>.</summary>
+    /// <summary>
+    /// Release cards that are no longer selected. A card whose reset or power restore failed
+    /// stays in the table: the error remains visible, later ticks retry, and shutdown can try again.
+    /// Caller holds <see cref="_lock"/>.
+    /// </summary>
     private void RetainOnly(int[] indices)
     {
         var keep = indices.ToHashSet();
         foreach (var lane in _lanes.Values.ToList())
         {
             if (keep.Contains(lane.Index)) continue;
-            ReleaseLane(lane);
-            _lanes.Remove(lane.Index);
+            if (ReleaseLane(lane)) _lanes.Remove(lane.Index);
         }
     }
 
@@ -383,27 +393,37 @@ public sealed class GuardEngine : IDisposable
         lane.CurrentPowerCap = watts;
     }
 
-    private void ReleaseLane(Lane lane)
+    /// <summary>Returns true only after clocks and the saved power limit are actually restored.</summary>
+    private bool ReleaseLane(Lane lane)
     {
         try
         {
-            if (lane.CurrentCap != 0) Nvidia.ResetClocks(lane.Index);
+            if (lane.CurrentCap != 0)
+            {
+                Nvidia.ResetClocks(lane.Index);
+                lane.CurrentCap = 0;
+            }
             if (lane.RestorePowerW is int w)
             {
                 Nvidia.SetPowerLimit(lane.Index, w);
                 lane.RestorePowerW = null;
             }
+            lane.CurrentPowerCap = 0;
+            lane.Active = ActiveMode.None;
+            lane.LastAction = "off";
+            lane.LastError = null;
+            return true;
         }
         catch (Exception ex)
         {
+            // Leave CurrentCap / RestorePowerW in place so a later call retries the failed step.
             lane.LastError = ex.Message;
             Log($"GPU #{lane.Index} release failed: " + ex.Message);
+            return false;
         }
-        lane.CurrentCap = 0;
-        lane.CurrentPowerCap = 0;
-        lane.Active = ActiveMode.None;
-        lane.LastAction = "off";
     }
+
+    private static bool NeedsRelease(Lane lane) => lane.CurrentCap != 0 || lane.RestorePowerW != null;
 
     private static string Shorten(string msg)
     {
