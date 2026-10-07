@@ -17,6 +17,8 @@ public enum ControlMode
 public sealed class Config
 {
     public int GpuIndex { get; set; } = 0;
+    /// <summary>When true, every installed GPU is guarded with these rules. GpuIndex is ignored.</summary>
+    public bool ControlAllGpus { get; set; } = true;
     public bool AutoCoolEnabled { get; set; } = true;
     public ControlMode ControlMode { get; set; } = ControlMode.Auto;
     public int TargetTempC { get; set; } = 70;      // drop clocks above this
